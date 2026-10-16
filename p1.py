@@ -1,9 +1,22 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import math
 import io
 import folium
 import streamlit.components.v1 as components
+
+# ---------------------------------------------------------
+# ฟังก์ชันคำนวณระยะทางด้วยสูตร Haversine (กิโลเมตร)
+# ---------------------------------------------------------
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0 # รัศมีโลก
+    lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
 
 # ---------------------------------------------------------
 # การตั้งค่าหน้าเว็บ Streamlit
@@ -11,7 +24,8 @@ import streamlit.components.v1 as components
 st.set_page_config(page_title="TMS Route Optimization (Savings Algorithm)", layout="wide")
 st.title("🚛 ระบบบริหารจัดการเส้นทางและลดต้นทุนขนส่ง (TMS)")
 st.markdown("""
-ระบบนี้ใช้ **Savings Algorithm** คำนวณเส้นทางที่ประหยัดที่สุด (ดึงระยะทางตรงจาก Distance Matrix ของไฟล์ Excel)
+ระบบนี้ใช้ **Savings Algorithm** คำนวณเส้นทางที่ประหยัดที่สุด (รองรับโครงสร้างไฟล์ TMS_Savings_Route_Plan 2)
+ระบบจะดึงพิกัด Depot และลูกค้าอัตโนมัติ พร้อมเปรียบเทียบต้นทุนและแสดงแผนที่
 """)
 
 # ---------------------------------------------------------
@@ -27,68 +41,57 @@ uploaded_file = st.sidebar.file_uploader("📂 อัปโหลดไฟล์
 if uploaded_file is not None:
     try:
         # ---------------------------------------------------------
-        # 1. อ่านข้อมูลพิกัด (สำหรับการปักหมุดแผนที่)
+        # ส่วนการอ่านไฟล์โครงสร้างใหม่ (TMS_Savings_Route_Plan 2)
         # ---------------------------------------------------------
+        # 1. อ่านพิกัดจากชีต '1.Distance Matrix'
         df_dist = pd.read_excel(uploaded_file, sheet_name='1.Distance Matrix')
-        df_dist_data = df_dist.iloc[2:].reset_index(drop=True)
         
-        df_coords = df_dist_data.iloc[:, 0:3].copy()
-        df_coords.columns = ['ชื่อลูกค้า', 'Latitude', 'Longitude']
-        df_coords['Latitude'] = pd.to_numeric(df_coords['Latitude'], errors='coerce')
-        df_coords['Longitude'] = pd.to_numeric(df_coords['Longitude'], errors='coerce')
+        # ตัด 2 แถวแรกที่เป็น Header ของ Matrix ออก
+        df_dist = df_dist.iloc[2:].reset_index(drop=True)
+        df_dist = df_dist[['รายชื่อร้าน', 'Lat', 'Lon']]
+        
+        # แปลง Data Type เป็นตัวเลข
+        df_dist['Lat'] = pd.to_numeric(df_dist['Lat'], errors='coerce')
+        df_dist['Lon'] = pd.to_numeric(df_dist['Lon'], errors='coerce')
 
-        # พิกัดโรงงาน
-        depot_row = df_coords[df_coords['ชื่อลูกค้า'] == 'โรงงาน (จุดเริ่มต้น)']
+        # ดึงพิกัด Depot (โรงงาน) จากข้อมูลโดยตรง
+        depot_row = df_dist[df_dist['รายชื่อร้าน'] == 'โรงงาน (จุดเริ่มต้น)']
         if not depot_row.empty:
-            depot_lat = depot_row['Latitude'].values[0]
-            depot_lon = depot_row['Longitude'].values[0]
+            depot_lat = depot_row['Lat'].values[0]
+            depot_lon = depot_row['Lon'].values[0]
         else:
-            depot_lat, depot_lon = 13.52596, 100.173329
+            depot_lat, depot_lon = 13.52596, 100.173329 # สำรองกรณีไม่พบ
+            
+        # กรองเฉพาะรายชื่อลูกค้า (ไม่รวมโรงงาน) และลบรายการที่ไม่มีพิกัด
+        df_customers = df_dist[df_dist['รายชื่อร้าน'] != 'โรงงาน (จุดเริ่มต้น)'].copy()
+        df_customers = df_customers.dropna(subset=['Lat', 'Lon'])
 
-        # ---------------------------------------------------------
-        # 2. อ่าน Distance Matrix ตรงๆ จาก Excel (เพื่อให้ต้นทุนเป๊ะ)
-        # ---------------------------------------------------------
-        matrix_values = df_dist_data.iloc[:, 3:].copy()
-        matrix_values = matrix_values.replace('-', np.nan).astype(float).values
-        matrix_values[np.isnan(matrix_values)] = 999999.0 # จุดออนไลน์ไม่มีระยะทาง ให้ข้าม
-
-        # ---------------------------------------------------------
-        # 3. แมป Demand และคัดกรองเฉพาะ "จัดเส้นทางรถ"
-        # ---------------------------------------------------------
+        # 2. อ่านค่า Demand จากชีต 'Demand Mapping'
         df_demand = pd.read_excel(uploaded_file, sheet_name='Demand Mapping')
-        df_demand = df_demand[['ชื่อร้าน/Node', 'Demand (กก.)', 'สถานะ TMS']]
+        df_demand = df_demand[['ชื่อร้าน/Node', 'Demand (กก.)']]
 
-        df_coords = df_coords.merge(df_demand, left_on='ชื่อลูกค้า', right_on='ชื่อร้าน/Node', how='left')
-        df_coords['Demand (กก.)'] = df_coords['Demand (กก.)'].fillna(0)
+        # 3. นำพิกัดและ Demand มารวมกัน
+        df_customers = df_customers.merge(df_demand, left_on='รายชื่อร้าน', right_on='ชื่อร้าน/Node', how='left')
+        df_customers['Demand (กก.)'] = df_customers['Demand (กก.)'].fillna(0) # เติม 0 ให้รายการที่ไม่มี Demand
+        df_customers = df_customers.rename(columns={'รายชื่อร้าน': 'ชื่อลูกค้า', 'Lat': 'Latitude', 'Lon': 'Longitude'})
+        df_customers = df_customers[['ชื่อลูกค้า', 'Latitude', 'Longitude', 'Demand (กก.)']]
 
-        valid_indices = [] # เก็บ Index ของร้านค้าที่จะจัดส่งจริง (ตัด Depot ออกก่อน)
-        for idx, row in df_coords.iterrows():
-            if idx == 0:
-                continue # ข้ามโรงงาน
-            if row['สถานะ TMS'] == 'จัดเส้นทางรถ':
-                valid_indices.append(idx)
-                
-        customers = []
-        for c_i in valid_indices:
-            customers.append(df_coords.iloc[c_i].to_dict())
-
+        customers = df_customers.to_dict('records')
         n = len(customers)
+        
         st.success(f"โหลดข้อมูลสำเร็จ: พบจุดส่ง {n} จุด | ยอด Demand รวม {sum([c['Demand (กก.)'] for c in customers]):,.0f} กก.")
         
         # ---------------------------------------------------------
-        # 4. สร้าง Matrix เฉพาะลูกค้าที่จัดเส้นทาง
+        # การคำนวณ Distance Matrix และ Savings Matrix
         # ---------------------------------------------------------
         dist_matrix = np.zeros((n + 1, n + 1))
         for i in range(n):
-            c_i = valid_indices[i]
-            dist_matrix[0][i+1] = matrix_values[0, c_i]
-            dist_matrix[i+1][0] = matrix_values[c_i, 0]
+            dist_matrix[0][i+1] = haversine(depot_lat, depot_lon, customers[i]['Latitude'], customers[i]['Longitude']) * 1.3
+            dist_matrix[i+1][0] = dist_matrix[0][i+1]
             for j in range(n):
                 if i != j:
-                    c_j = valid_indices[j]
-                    dist_matrix[i+1][j+1] = matrix_values[c_i, c_j]
+                    dist_matrix[i+1][j+1] = haversine(customers[i]['Latitude'], customers[i]['Longitude'], customers[j]['Latitude'], customers[j]['Longitude']) * 1.3
 
-        # คำนวณ Savings
         savings = []
         for i in range(1, n + 1):
             for j in range(i + 1, n + 1):
@@ -104,7 +107,7 @@ if uploaded_file is not None:
         df_savings = pd.DataFrame(savings).sort_values(by='Saving_Distance', ascending=False).reset_index(drop=True)
         
         # ---------------------------------------------------------
-        # 5. Routing Algorithm
+        # สร้างเส้นทาง (Routing Algorithm)
         # ---------------------------------------------------------
         routes = [[i] for i in range(1, n + 1)] 
         
@@ -142,7 +145,7 @@ if uploaded_file is not None:
                         routes.append(new_route)
 
         # ---------------------------------------------------------
-        # 6. สรุปผลลัพธ์
+        # สรุปผลลัพธ์
         # ---------------------------------------------------------
         total_distance = 0
         route_summaries = []
@@ -162,7 +165,7 @@ if uploaded_file is not None:
             total_distance += route_dist
             
             route_summaries.append({
-                "คันที่": f"คันที่ {idx + 1:02d}",
+                "คันที่": idx + 1,
                 "ลำดับเส้นทาง": " ➔ ".join(path_names),
                 "ระยะทาง (กม.)": round(route_dist, 2),
                 "Demand รวม (กก.)": round(route_demand, 2),
@@ -173,15 +176,15 @@ if uploaded_file is not None:
         optimized_cost = total_distance * cost_per_km
         cost_saving = original_cost - optimized_cost
 
-        # ================= Dashboard =================
-        st.subheader("📊 เปรียบเทียบผลลัพธ์การลดต้นทุน")
+        # ================= ส่วนการแสดงผล Dashboard =================
+        st.subheader("📊 เปรียบเทียบผลลัพธ์การลดต้นทุน (Cost Reduction)")
         col1, col2, col3 = st.columns(3)
         col1.metric("ต้นทุนเดิม (โดยประมาณ)", f"{original_cost:,.2f} ฿")
         col2.metric("ต้นทุนใหม่ (Optimized)", f"{optimized_cost:,.2f} ฿", delta=f"-{cost_saving:,.2f} ฿")
         col3.metric("ระยะทางรวมใหม่", f"{total_distance:,.2f} กม.")
         
-        # ================= แผนที่ =================
-        st.subheader("🗺️ แผนที่เส้นทางการจัดส่ง")
+        # ================= แผนที่ (Folium Map) =================
+        st.subheader("🗺️ แผนที่เส้นทางการจัดส่ง (จำแนกสีตามคันรถ)")
         map_colors = ['blue', 'green', 'purple', 'orange', 'darkred', 'lightred', 
                       'beige', 'darkblue', 'darkgreen', 'cadetblue', 'darkpurple', 'pink']
         
@@ -189,7 +192,7 @@ if uploaded_file is not None:
         
         folium.Marker(
             [depot_lat, depot_lon],
-            popup="<b>โรงงาน</b>",
+            popup="<b>โรงงาน (จุดเริ่มต้น)</b>",
             icon=folium.Icon(color="red", icon="home", prefix='fa')
         ).add_to(m)
         
@@ -200,29 +203,34 @@ if uploaded_file is not None:
             for node in route:
                 cust = customers[node-1]
                 lat, lon = cust['Latitude'], cust['Longitude']
-                if not pd.isna(lat) and not pd.isna(lon):
-                    route_coords.append([lat, lon])
-                    folium.Marker(
-                        [lat, lon],
-                        popup=f"<b>{cust['ชื่อลูกค้า']}</b><br>Demand: {cust['Demand (กก.)']} กก.",
-                        icon=folium.Icon(color=color, icon="info-sign")
-                    ).add_to(m)
+                route_coords.append([lat, lon])
+                
+                folium.Marker(
+                    [lat, lon],
+                    popup=f"<b>{cust['ชื่อลูกค้า']}</b><br>Demand: {cust['Demand (กก.)']} กก.<br>รถคันที่ {idx + 1}",
+                    icon=folium.Icon(color=color, icon="info-sign")
+                ).add_to(m)
                 
             route_coords.append([depot_lat, depot_lon])
             
-            # กรองค่า NaN ออกก่อนลากเส้น
-            valid_coords = [c for c in route_coords if not pd.isna(c[0])]
-            if len(valid_coords) > 1:
-                folium.PolyLine(valid_coords, color=color, weight=3, opacity=0.8).add_to(m)
+            folium.PolyLine(
+                route_coords,
+                color=color,
+                weight=3,
+                opacity=0.8,
+                tooltip=f"เส้นทางรถคันที่ {idx + 1}"
+            ).add_to(m)
             
+        # แสดงแผนที่ด้วย HTML (เสถียรกว่า)
         map_html = m._repr_html_()
         components.html(map_html, height=600, width=1200)
 
-        # ================= ตารางสรุป =================
+        # ================= ตารางสรุปเส้นทางและเซฟไฟล์ =================
         st.subheader("📍 สรุปเส้นทางเดินรถ (Optimized Routes)")
         st.dataframe(df_routes, use_container_width=True)
 
         st.subheader("🧮 ตาราง Savings Matrix")
+        # แสดงผลครบทุกคู่ ไม่ตัดแล้ว
         st.dataframe(df_savings, use_container_width=True)
 
         output = io.BytesIO()
@@ -240,6 +248,7 @@ if uploaded_file is not None:
         )
         
     except Exception as e:
-        st.error(f"เกิดข้อผิดพลาด: {e}")
+        st.error(f"เกิดข้อผิดพลาดในการประมวลผล: {e}")
+
 else:
     st.info("กรุณาอัปโหลดไฟล์ Excel ของคุณที่แถบด้านซ้ายมือเพื่อเริ่มการวิเคราะห์")
