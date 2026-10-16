@@ -36,35 +36,43 @@ vehicle_capacity = st.sidebar.number_input("ความจุรถสูงส
 cost_per_km = st.sidebar.number_input("ต้นทุนน้ำมัน (บาท/กม.)", value=5.7143, format="%.4f")
 original_cost = st.sidebar.number_input("ต้นทุนเดิมเพื่อเปรียบเทียบ (บาท)", value=27904.72) 
 
-uploaded_file = st.sidebar.file_uploader("📂 อัปโหลดไฟล์ Excel ของลูกค้า", type=['xlsx'])
+uploaded_file = st.sidebar.file_uploader("📂 อัปโหลดไฟล์ Excel ของลูกค้า (รูปแบบ TMS_Savings 2)", type=['xlsx'])
 
 if uploaded_file is not None:
     try:
         # ---------------------------------------------------------
         # ส่วนการอ่านไฟล์โครงสร้างใหม่ (TMS_Savings_Route_Plan 2)
         # ---------------------------------------------------------
+        # 1. อ่านพิกัดจากชีต '1.Distance Matrix'
         df_dist = pd.read_excel(uploaded_file, sheet_name='1.Distance Matrix')
+        
+        # ตัด 2 แถวแรกที่เป็น Header ของ Matrix ออก
         df_dist = df_dist.iloc[2:].reset_index(drop=True)
         df_dist = df_dist[['รายชื่อร้าน', 'Lat', 'Lon']]
         
+        # แปลง Data Type เป็นตัวเลข
         df_dist['Lat'] = pd.to_numeric(df_dist['Lat'], errors='coerce')
         df_dist['Lon'] = pd.to_numeric(df_dist['Lon'], errors='coerce')
 
+        # ดึงพิกัด Depot (โรงงาน) จากข้อมูลโดยตรง
         depot_row = df_dist[df_dist['รายชื่อร้าน'] == 'โรงงาน (จุดเริ่มต้น)']
         if not depot_row.empty:
             depot_lat = depot_row['Lat'].values[0]
             depot_lon = depot_row['Lon'].values[0]
         else:
-            depot_lat, depot_lon = 13.52596, 100.173329
+            depot_lat, depot_lon = 13.52596, 100.173329 # สำรองกรณีไม่พบ
             
+        # กรองเฉพาะรายชื่อลูกค้า (ไม่รวมโรงงาน) และลบรายการที่ไม่มีพิกัด
         df_customers = df_dist[df_dist['รายชื่อร้าน'] != 'โรงงาน (จุดเริ่มต้น)'].copy()
         df_customers = df_customers.dropna(subset=['Lat', 'Lon'])
 
+        # 2. อ่านค่า Demand จากชีต 'Demand Mapping'
         df_demand = pd.read_excel(uploaded_file, sheet_name='Demand Mapping')
         df_demand = df_demand[['ชื่อร้าน/Node', 'Demand (กก.)']]
 
+        # 3. นำพิกัดและ Demand มารวมกัน
         df_customers = df_customers.merge(df_demand, left_on='รายชื่อร้าน', right_on='ชื่อร้าน/Node', how='left')
-        df_customers['Demand (กก.)'] = df_customers['Demand (กก.)'].fillna(0)
+        df_customers['Demand (กก.)'] = df_customers['Demand (กก.)'].fillna(0) # เติม 0 ให้รายการที่ไม่มี Demand
         df_customers = df_customers.rename(columns={'รายชื่อร้าน': 'ชื่อลูกค้า', 'Lat': 'Latitude', 'Lon': 'Longitude'})
         df_customers = df_customers[['ชื่อลูกค้า', 'Latitude', 'Longitude', 'Demand (กก.)']]
 
@@ -213,16 +221,17 @@ if uploaded_file is not None:
                 tooltip=f"เส้นทางรถคันที่ {idx + 1}"
             ).add_to(m)
             
-        # แสดงผลแผนที่ด้วย HTML Component (แก้ปัญหา JSON Error)
+        # แสดงแผนที่ด้วย HTML (เสถียรกว่า)
         map_html = m._repr_html_()
-        components.html(map_html, height=600)
+        components.html(map_html, height=600, width=1200)
 
         # ================= ตารางสรุปเส้นทางและเซฟไฟล์ =================
         st.subheader("📍 สรุปเส้นทางเดินรถ (Optimized Routes)")
         st.dataframe(df_routes, use_container_width=True)
 
         st.subheader("🧮 ตาราง Savings Matrix")
-        st.dataframe(df_savings.head(50), use_container_width=True)
+        # แสดงผลครบทุกคู่ ไม่ตัดแล้ว
+        st.dataframe(df_savings, use_container_width=True)
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
